@@ -145,6 +145,7 @@ elif os.name == 'posix':
             self.fd = sys.stdin.fileno()
             self.old = termios.tcgetattr(self.fd)
             atexit.register(self.cleanup)
+            self.cursor_idx = 0
             if sys.version_info < (3, 0):
                 self.enc_stdin = codecs.getreader(sys.stdin.encoding)(sys.stdin)
             else:
@@ -162,6 +163,52 @@ elif os.name == 'posix':
             if c == unichr(0x7f):
                 c = unichr(8)    # map the BS key (which yields DEL) to backspace
             return c
+
+        def write(self, text, update_cursor_idx=False):
+            # print ("\nText: {} | Cursor_Idx: {}\n".format(text, self.cursor_idx))
+            super(Console, self).write(text)
+            if update_cursor_idx:
+                self.cursor_idx += len(text)
+
+        def clear_line(self):
+            self.write('\r\033[K\r')
+            self.cursor_idx = 0
+
+        def move_backwards(self, n=1):
+            self.write("\033[{}D".format(n))
+            self.cursor_idx = max(self.cursor_idx - n, 0)
+
+        def move_forward(self, max_pos=-1):
+            if self.cursor_idx < max_pos:
+                self.write("\033[1C")
+            self.cursor_idx = min(self.cursor_idx + 1, max_pos)
+
+        def insert_character(self, buf, c):
+            old_idx = self.cursor_idx
+            self.write("\033[K")
+            self.write(c, True)
+            self.write(''.join(buf[self.cursor_idx:]))
+            self.move_backwards(len(buf[self.cursor_idx:]))
+            self.cursor_idx = old_idx + 1
+
+        def remove_character(self, buf):
+            old_idx = self.cursor_idx
+            self.move_backwards()
+            self.write("\033[K")
+            self.write(''.join(buf[old_idx - 1:]))
+            self.move_backwards(len(buf[old_idx - 1:]))
+            self.cursor_idx = old_idx - 1
+
+        def entf_character(self, buf):
+            old_idx = self.cursor_idx
+            tmp = ''.join(buf[old_idx:])
+            if len(tmp) > 0:
+                self.write("\033[K")
+                self.write(tmp)
+                self.move_backwards(len(tmp))
+                self.cursor_idx = old_idx
+            else:
+                self.write("\033[K")
 
         def cancel(self):
             fcntl.ioctl(self.fd, termios.TIOCSTI, b'\0')
@@ -349,13 +396,31 @@ class Miniterm(object):
         self.eol = eol
         self.filters = filters
         self.update_transformations()
-        self.exit_character = unichr(0x1d)  # GS/CTRL+]
-        self.menu_character = unichr(0x14)  # Menu: CTRL+T
+        self.exit_character = 0x1d  # GS/CTRL+]
+        self.menu_character = 0x14  # Menu: CTRL+T
+
+        self.arrow_up_key = unichr(27) + unichr(91) + unichr(65)
+        self.arrow_down_key = unichr(27) + unichr(91) + unichr(66)
+        self.arrow_right_key = unichr(27) + unichr(91) + unichr(67)
+        self.arrow_left_key = unichr(27) + unichr(91) + unichr(68)
+        self.entf_key = unichr(27) + unichr(91) + unichr(51) + unichr(126)
+
+        self.escape_sequence = False
+
         self.alive = None
         self._reader_alive = None
         self.receiver_thread = None
         self.rx_decoder = None
         self.tx_decoder = None
+
+        self._update_buf_idx = True
+        self.history_list = []
+        self.history_idx = -1
+        self.buf = []
+        self.buf_idx = 0
+
+        # self.fd = open("debug.log", "w")
+        # self.p = subprocess.Popen(["xterm", "-e", "tail", "-f", "debug.log"])
 
     def _start_reader(self):
         """Start reader thread"""
@@ -478,23 +543,156 @@ class Miniterm(object):
                     menu_active = False
                 elif c == self.menu_character:
                     menu_active = True      # next char will be for menu
-                elif c == self.exit_character:
+                elif c == self.exit_character or c == unichr(3):
                     self.stop()             # exit app
                     break
-                else:
-                    #~ if self.raw:
-                    text = c
+                elif c == unichr(8):
+                    self.handle_backspace_key()
+                elif c == unichr(27):
+                    self.buf.append(c)
+                    self.escape_sequence = True
+                elif self.escape_sequence:
+                    self.buf.append(c)
+                    if len(self.buf) >= 3:
+                        if ''.join(self.buf[-3:]) == self.arrow_up_key:
+                            self.handle_arrow_up_key()
+                            self.escape_sequence = False
+                        elif ''.join(self.buf[-3:]) == self.arrow_down_key:
+                            self.handle_arrow_down_key()
+                            self.escape_sequence = False
+                        elif ''.join(self.buf[-3:]) == self.arrow_left_key:
+                            self.handle_arrow_left_key()
+                            self.escape_sequence = False
+                        elif ''.join(self.buf[-3:]) == self.arrow_right_key:
+                            self.handle_arrow_right_key()
+                            self.escape_sequence = False
+
+                    if len(self.buf) >= 4:
+                        if ''.join(self.buf[-4:]) == self.entf_key:
+                            self.handle_entf_key()
+                            self.escape_sequence = False
+                elif c == u'\n':
+                    if not self.buf:
+                        continue
+
+                    text = ''.join(self.buf) + '\n'
+
                     for transformation in self.tx_transformations:
                         text = transformation.tx(text)
+
                     self.serial.write(self.tx_encoder.encode(text))
+
+                    if self.history_list:
+                        if self.history_list[0] != self.buf:
+                            self.history_list = [self.buf] + self.history_list
+                    else:
+                        self.history_list = [self.buf] + self.history_list
+
+                    self.buf = []
+                    self.history_idx = -1
+                    self.console.cursor_idx = 0
+                else:
+                    self.buf.insert(self.console.cursor_idx, c)
+
                     if self.echo:
                         echo_text = c
-                        for transformation in self.tx_transformations:
-                            echo_text = transformation.echo(echo_text)
-                        self.console.write(echo_text)
+
+                        if echo_text != '':
+                            for transformation in self.tx_transformations:
+                                echo_text = transformation.echo(echo_text)
+
+                            if self.console.cursor_idx == len(self.buf) - 1:
+                                self.console.write(echo_text, True)
+                            else:
+                                self.console.insert_character(self.buf, echo_text)
+
         except:
             self.alive = False
             raise
+
+    def handle_arrow_up_key(self):
+        if self.history_list:
+            self.history_idx = (self.history_idx + 1) if self.history_idx < len(self.history_list) - 1 else len(self.history_list) - 1
+
+            self.buf = self.history_list[self.history_idx][::]
+
+            self.console.clear_line()
+            echo_text = ''.join(self.buf).replace(self.arrow_up_key, "")
+            if self.echo and echo_text != '':
+                for transformation in self.tx_transformations:
+                    echo_text = transformation.echo(echo_text)
+                self.console.write(echo_text, True)
+        else:
+            self.buf = self.buf[:len(self.buf) - 3]
+
+
+    def handle_arrow_down_key(self):
+        if self.history_idx <= 0:
+            self.buf = []
+            self.console.clear_line()
+            self.history_idx = -1
+        elif len(self.buf) > 3:
+            if self.history_list:
+                self.history_idx = (self.history_idx - 1) if self.history_idx > 0 else 0
+                self.buf = self.history_list[self.history_idx][::]
+
+                self.console.clear_line()
+                echo_text = ''.join(self.buf).replace(self.arrow_down_key, "")
+                if self.echo and echo_text != '':
+                    for transformation in self.tx_transformations:
+                        echo_text = transformation.echo(echo_text)
+                    self.console.write(echo_text, True)
+        else:
+            self.buf = []
+
+    def handle_arrow_left_key(self):
+        self.buf = self.buf[:len(self.buf) - 3]
+        self.console.move_backwards()
+
+    def handle_arrow_right_key(self):
+        self.buf = self.buf[:len(self.buf) - 3]
+        self.console.move_forward(max_pos=len(self.buf))
+
+    def handle_backspace_key(self):
+        if self.console.cursor_idx == 0:
+            return
+
+        if 0 < self.console.cursor_idx <= len(self.buf):
+            del self.buf[self.console.cursor_idx - 1]
+
+        if self.echo:
+            echo_text = ''.join(self.buf)
+
+            if echo_text != '':
+                for transformation in self.tx_transformations:
+                    echo_text = transformation.echo(echo_text)
+
+                if self.console.cursor_idx == len(self.buf) + 1:
+                    self.console.clear_line()
+                    self.console.write(echo_text, True)
+                else:
+                    self.console.remove_character(self.buf)
+            else:
+                self.console.clear_line()
+
+    def handle_entf_key(self):
+        self.buf = self.buf[:len(self.buf) - 4]
+
+        if 0 <= self.console.cursor_idx < len(self.buf):
+            del self.buf[self.console.cursor_idx]
+        else:
+            return
+
+        if self.echo:
+            echo_text = ''.join(self.buf)
+
+            if echo_text != '':
+                for transformation in self.tx_transformations:
+                    echo_text = transformation.echo(echo_text)
+                self.console.entf_character(self.buf)
+            else:
+                self.console.clear_line()
+                self.buf = []
 
     def handle_menu_key(self, c):
         """Implement a simple menu / settings"""
